@@ -30,13 +30,17 @@ from scheduler import (
     restore_persisted_reminders,
 )
 
-# Configure logging
+# Configure logging to both file and console (safely handles background pythonw)
+log_handlers: list[logging.Handler] = [
+    logging.FileHandler("bot.log", encoding="utf-8"),
+]
+if sys.stdout is not None:
+    log_handlers.append(logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=log_handlers,
 )
 logger = logging.getLogger(__name__)
 
