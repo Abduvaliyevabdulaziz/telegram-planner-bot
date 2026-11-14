@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -76,8 +78,41 @@ async def on_startup(bot: Bot, db: Database, scheduler) -> None:
         )
 
 
-async def on_shutdown(bot: Bot, scheduler) -> None:
+async def start_health_server(port: int = 8080) -> web.AppRunner:
+    """
+    Starts a lightweight HTTP server for cloud platforms (Render, Koyeb, Railway).
+    Allows free cloud hosting with zero-downtime health checking.
+    """
+    app = web.Application()
+
+    async def health(request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                "🤖 Telegram Expense Tracker & Smart Daily Planner Bot is LIVE!\n"
+                f"• Timezone: {settings.TIMEZONE_NAME}\n"
+                f"• Status: Healthy & Polling 24/7\n"
+            ),
+            content_type="text/plain",
+        )
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_get("/ping", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Cloud health-check HTTP server listening on 0.0.0.0:{port}")
+    return runner
+
+
+async def on_shutdown(bot: Bot, scheduler, web_runner: web.AppRunner | None = None) -> None:
     """Graceful shutdown actions."""
+    if web_runner:
+        logger.info("Stopping HTTP health server...")
+        await web_runner.cleanup()
+
     logger.info("Shutting down APScheduler...")
     if scheduler.running:
         scheduler.shutdown(wait=False)
@@ -135,7 +170,15 @@ async def main() -> None:
     # 8. Run startup lifecycle
     await on_startup(bot, db, scheduler)
 
-    # 9. Start polling
+    # 9. Start cloud HTTP health server (enables Render Free Web Service & Koyeb 24/7)
+    web_runner: web.AppRunner | None = None
+    try:
+        http_port = int(os.getenv("PORT", "8080"))
+        web_runner = await start_health_server(http_port)
+    except Exception as e:
+        logger.warning(f"Could not bind HTTP health port: {e}. Polling will continue normally.")
+
+    # 10. Start polling
     try:
         # Delete webhook to prevent conflicts with long polling
         await bot.delete_webhook(drop_pending_updates=True)
@@ -144,7 +187,7 @@ async def main() -> None:
             allowed_updates=dp.resolve_used_update_types(),
         )
     finally:
-        await on_shutdown(bot, scheduler)
+        await on_shutdown(bot, scheduler, web_runner)
 
 
 if __name__ == "__main__":
