@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "🚀 Run Telegram Bot (main.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "🧪 Run Unit Tests (test_bot.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_bot.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "🧪 Run Async DB Integration Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_database_async.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}

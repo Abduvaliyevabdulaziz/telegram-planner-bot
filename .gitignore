@@ -1,0 +1,32 @@
+# Environment variables and secrets (NEVER commit .env)
+.env
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# SQLite databases
+*.db
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# VS Code (keep settings if desired, but ignore local workspace storage)
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json

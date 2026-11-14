@@ -1,0 +1,414 @@
+"""
+Asynchronous SQLite Database Manager using aiosqlite.
+Manages expenses and tasks persistence across bot restarts.
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any
+import aiosqlite
+
+from config import settings, format_dt, get_now
+
+
+class Database:
+    def __init__(self, db_path: Path | str | None = None) -> None:
+        self.db_path = str(db_path or settings.DB_PATH)
+
+    async def init_db(self) -> None:
+        """Create tables and indexes if they do not exist."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL;")
+            await db.execute("PRAGMA foreign_keys=ON;")
+
+            # Expenses table
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    amount INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_expenses_user_created 
+                ON expenses(user_id, created_at);
+                """
+            )
+
+            # Tasks table
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    task_text TEXT NOT NULL,
+                    target_date TEXT NOT NULL,
+                    remind_at TEXT,
+                    is_completed INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tasks_user_target 
+                ON tasks(user_id, target_date);
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tasks_remind 
+                ON tasks(is_completed, remind_at);
+                """
+            )
+            await db.commit()
+
+    # =========================================================================
+    # Expenses Operations
+    # =========================================================================
+
+    async def add_expense(
+        self, user_id: int, amount: int, category: str, created_at: str | None = None
+    ) -> int:
+        """Add a new expense entry and return its ID."""
+        ts = created_at or format_dt(get_now())
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO expenses (user_id, amount, category, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, int(amount), category.strip(), ts),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def delete_expense(self, expense_id: int, user_id: int) -> bool:
+        """Delete an expense by ID if it belongs to the user."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM expenses WHERE id = ? AND user_id = ?",
+                (expense_id, user_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_expense_by_id(self, expense_id: int) -> dict[str, Any] | None:
+        """Fetch a single expense by its ID."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, user_id, amount, category, created_at FROM expenses WHERE id = ?",
+                (expense_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_expenses_sum_for_date(self, user_id: int, date_str: str) -> int:
+        """Calculate total amount spent on a specific date (YYYY-MM-DD)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Matches timestamps starting with 'YYYY-MM-DD'
+            async with db.execute(
+                """
+                SELECT COALESCE(SUM(amount), 0)
+                FROM expenses
+                WHERE user_id = ? AND created_at LIKE ?
+                """,
+                (user_id, f"{date_str}%"),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+    async def get_expense_stats_by_period(
+        self, user_id: int, start_dt: str, end_dt: str
+    ) -> dict[str, Any]:
+        """
+        Calculate total sum, category breakdown with percentages,
+        and last 10 individual transactions within a time period.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            # 1. Total sum and count
+            async with db.execute(
+                """
+                SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+                FROM expenses
+                WHERE user_id = ? AND created_at >= ? AND created_at <= ?
+                """,
+                (user_id, start_dt, end_dt),
+            ) as cursor:
+                sum_row = await cursor.fetchone()
+                total = int(sum_row["total"]) if sum_row else 0
+                count = int(sum_row["count"]) if sum_row else 0
+
+            # 2. Grouped breakdown by category
+            categories: list[dict[str, Any]] = []
+            if total > 0:
+                async with db.execute(
+                    """
+                    SELECT category, SUM(amount) AS cat_total, COUNT(*) AS cat_count
+                    FROM expenses
+                    WHERE user_id = ? AND created_at >= ? AND created_at <= ?
+                    GROUP BY category
+                    ORDER BY cat_total DESC
+                    """,
+                    (user_id, start_dt, end_dt),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for r in rows:
+                        cat_amount = int(r["cat_total"])
+                        percentage = round((cat_amount / total) * 100, 1)
+                        categories.append(
+                            {
+                                "category": r["category"],
+                                "amount": cat_amount,
+                                "count": int(r["cat_count"]),
+                                "percentage": percentage,
+                            }
+                        )
+
+            # 3. Last 10 transactions
+            recent: list[dict[str, Any]] = []
+            async with db.execute(
+                """
+                SELECT id, amount, category, created_at
+                FROM expenses
+                WHERE user_id = ? AND created_at >= ? AND created_at <= ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 10
+                """,
+                (user_id, start_dt, end_dt),
+            ) as cursor:
+                recent_rows = await cursor.fetchall()
+                recent = [dict(r) for r in recent_rows]
+
+            return {
+                "total": total,
+                "count": count,
+                "categories": categories,
+                "recent_transactions": recent,
+            }
+
+    async def get_all_expenses(self, user_id: int) -> list[dict[str, Any]]:
+        """Retrieve all expenses for CSV export."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, created_at, amount, category
+                FROM expenses
+                WHERE user_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (user_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+    # =========================================================================
+    # Tasks Operations
+    # =========================================================================
+
+    async def add_task(
+        self,
+        user_id: int,
+        task_text: str,
+        target_date: str,
+        remind_at: str | None = None,
+    ) -> int:
+        """Add a single task and return its ID."""
+        ts = format_dt(get_now())
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO tasks (user_id, task_text, target_date, remind_at, is_completed, created_at)
+                VALUES (?, ?, ?, ?, 0, ?)
+                """,
+                (user_id, task_text.strip(), target_date, remind_at, ts),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def add_multiple_tasks(
+        self, user_id: int, task_texts: list[str], target_date: str
+    ) -> list[int]:
+        """Add multiple tasks for a target date (e.g., from the nightly planning prompt)."""
+        ts = format_dt(get_now())
+        task_ids: list[int] = []
+        async with aiosqlite.connect(self.db_path) as db:
+            for text in task_texts:
+                cleaned = text.strip()
+                if not cleaned:
+                    continue
+                cursor = await db.execute(
+                    """
+                    INSERT INTO tasks (user_id, task_text, target_date, remind_at, is_completed, created_at)
+                    VALUES (?, ?, ?, NULL, 0, ?)
+                    """,
+                    (user_id, cleaned, target_date, ts),
+                )
+                task_ids.append(cursor.lastrowid)
+            await db.commit()
+        return task_ids
+
+    async def get_task_by_id(self, task_id: int) -> dict[str, Any] | None:
+        """Fetch a single task by ID."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, user_id, task_text, target_date, remind_at, is_completed, created_at
+                FROM tasks
+                WHERE id = ?
+                """,
+                (task_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def mark_task_completed(self, task_id: int, user_id: int) -> bool:
+        """Mark a task as completed."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE tasks SET is_completed = 1 WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def toggle_task_status(self, task_id: int, user_id: int) -> dict[str, Any] | None:
+        """Toggle task completion between 0 and 1."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT is_completed FROM tasks WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                new_status = 0 if row["is_completed"] == 1 else 1
+
+            await db.execute(
+                "UPDATE tasks SET is_completed = ? WHERE id = ? AND user_id = ?",
+                (new_status, task_id, user_id),
+            )
+            await db.commit()
+
+            async with db.execute(
+                "SELECT id, user_id, task_text, target_date, remind_at, is_completed FROM tasks WHERE id = ?",
+                (task_id,),
+            ) as cursor:
+                updated_row = await cursor.fetchone()
+                return dict(updated_row) if updated_row else None
+
+    async def delete_task(self, task_id: int, user_id: int) -> bool:
+        """Delete a task by ID."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM tasks WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def reschedule_reminder(self, task_id: int, new_remind_at: str) -> bool:
+        """Reschedule a task's reminder timestamp and reset completion status."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE tasks
+                SET remind_at = ?, is_completed = 0
+                WHERE id = ?
+                """,
+                (new_remind_at, task_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_tasks_for_date(self, user_id: int, target_date: str) -> list[dict[str, Any]]:
+        """Fetch all tasks planned for a specific date (YYYY-MM-DD)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, user_id, task_text, target_date, remind_at, is_completed, created_at
+                FROM tasks
+                WHERE user_id = ? AND target_date = ?
+                ORDER BY is_completed ASC, remind_at ASC NULLS LAST, id ASC
+                """,
+                (user_id, target_date),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+    async def get_scheduled_reminders_for_date(
+        self, user_id: int, target_date: str
+    ) -> list[dict[str, Any]]:
+        """Fetch all tasks with a reminder set for target_date."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, user_id, task_text, target_date, remind_at, is_completed
+                FROM tasks
+                WHERE user_id = ? AND remind_at LIKE ?
+                ORDER BY remind_at ASC, id ASC
+                """,
+                (user_id, f"{target_date}%"),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+    async def get_all_active_future_reminders(self) -> list[dict[str, Any]]:
+        """
+        Fetch all uncompleted tasks with a remind_at timestamp.
+        Used on bot startup to re-register APScheduler jobs across restarts.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, user_id, task_text, target_date, remind_at, is_completed
+                FROM tasks
+                WHERE is_completed = 0 AND remind_at IS NOT NULL
+                ORDER BY remind_at ASC
+                """
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
+    async def get_planner_dashboard(
+        self, user_id: int, today_str: str, tomorrow_str: str, now_dt_str: str
+    ) -> dict[str, Any]:
+        """Fetch all data needed for the interactive planner menu."""
+        today_tasks = await self.get_tasks_for_date(user_id, today_str)
+        tomorrow_tasks = await self.get_tasks_for_date(user_id, tomorrow_str)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, user_id, task_text, target_date, remind_at, is_completed
+                FROM tasks
+                WHERE user_id = ? AND is_completed = 0 AND remind_at >= ?
+                ORDER BY remind_at ASC
+                LIMIT 10
+                """,
+                (user_id, now_dt_str),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                upcoming_reminders = [dict(r) for r in rows]
+
+        return {
+            "today_tasks": today_tasks,
+            "tomorrow_tasks": tomorrow_tasks,
+            "upcoming_reminders": upcoming_reminders,
+        }
