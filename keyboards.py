@@ -130,8 +130,30 @@ def get_planner_dashboard_keyboard(
         InlineKeyboardButton(text="➕ Add Tomorrow Task", callback_data="action:add_tomorrow"),
     )
     builder.row(
+        InlineKeyboardButton(text="⏰ Set Alert / Reminder", callback_data="action:alert_menu"),
         InlineKeyboardButton(text="🗑️ Delete a Task", callback_data="action:delete_menu"),
+    )
+    builder.row(
         InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_planner"),
+    )
+    return builder.as_markup()
+
+
+def get_task_alert_selection_keyboard(tasks: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    """Inline keyboard listing tasks to set an alert for."""
+    builder = InlineKeyboardBuilder()
+    for task in tasks[:10]:
+        tid = task["id"]
+        short_text = task["task_text"][:24]
+        has_rem = "⏰ " if task.get("remind_at") else "🔔 "
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{has_rem}{short_text}",
+                callback_data=f"set_alert_task:{tid}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="🔙 Back to Planner", callback_data="refresh_planner")
     )
     return builder.as_markup()
 

@@ -30,6 +30,7 @@ from keyboards import (
     get_planner_dashboard_keyboard,
     get_reminder_alert_keyboard,
     get_task_delete_keyboard,
+    get_task_alert_selection_keyboard,
     get_main_reply_keyboard,
 )
 from scheduler import schedule_task_reminder, cancel_task_reminder
@@ -48,6 +49,7 @@ class PlannerStates(StatesGroup):
     waiting_for_quick_todo = State()
     waiting_for_single_today_task = State()
     waiting_for_single_tomorrow_task = State()
+    waiting_for_task_alert_time = State()
 
 
 # =============================================================================
@@ -97,8 +99,15 @@ def parse_remind_command(arg: str, now: datetime) -> tuple[datetime, str] | None
     Parses specific time/date expressions:
       - '18:30 Call client' -> today or tomorrow at 18:30
       - '2026-11-20 14:00 Submit project' -> specific datetime
+      - '45m Check oven' -> relative timer
     """
     cleaned = arg.strip()
+
+    # Case 0: Relative duration (e.g. 45m, 2h, 1h30m)
+    rel = parse_relative_time(cleaned)
+    if rel:
+        delta, task_text = rel
+        return now + delta, task_text
 
     # Case 1: YYYY-MM-DD HH:MM task text
     m_full = re.match(r"^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})\s+(.*)$", cleaned)
@@ -390,7 +399,7 @@ async def receive_quick_todo_text(
     )
 
 
-@router.message(Command("remind"))
+@router.message(Command("remind", "alert"))
 async def handle_remind_command(
     message: Message,
     db: Database,
@@ -399,7 +408,9 @@ async def handle_remind_command(
     """
     Schedule a timed reminder at a specific time or date:
       - /remind 18:30 Call client
+      - /alert 18:30 Call client
       - /remind 2026-11-20 14:00 Submit project
+      - /alert 45m Check oven
     """
     user_id = message.from_user.id
     text = (message.text or "").strip()
@@ -763,3 +774,122 @@ async def handle_delete_task(
             await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
         except Exception:
             pass
+
+
+@router.callback_query(F.data == "action:alert_menu")
+async def callback_alert_menu(callback: CallbackQuery, db: Database) -> None:
+    """Display task alert setting menu for today and tomorrow's active tasks."""
+    user_id = callback.from_user.id
+    today_str = get_today_str()
+    tomorrow_str = get_tomorrow_str()
+
+    today_tasks = await db.get_tasks_for_date(user_id, today_str)
+    tomorrow_tasks = await db.get_tasks_for_date(user_id, tomorrow_str)
+
+    # Filter uncompleted tasks
+    pending = [t for t in (today_tasks + tomorrow_tasks) if t.get("is_completed", 0) == 0]
+
+    if not pending:
+        await callback.answer("No active tasks found to set alerts for.", show_alert=True)
+        return
+
+    keyboard = get_task_alert_selection_keyboard(pending)
+    if callback.message:
+        await callback.message.edit_text(
+            "⏰ <b>Select a task to attach an alert/reminder to:</b>",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_alert_task:"))
+async def callback_set_alert_task(
+    callback: CallbackQuery, state: FSMContext, db: Database
+) -> None:
+    """Prompt user to enter the alert time for the selected task."""
+    parts = callback.data.split(":")
+    if len(parts) != 2 or not parts[1].isdigit():
+        await callback.answer("Invalid request.")
+        return
+
+    task_id = int(parts[1])
+    task = await db.get_task_by_id(task_id)
+    if not task:
+        await callback.answer("Task not found.", show_alert=True)
+        return
+
+    await state.set_state(PlannerStates.waiting_for_task_alert_time)
+    await state.update_data(alert_task_id=task_id, alert_task_text=task["task_text"])
+
+    prompt = (
+        f"⏰ <b>Set Alert for:</b> \"<b>{task['task_text']}</b>\"\n\n"
+        "Send the alert time in any of these formats:\n"
+        "• Specific time: <code>18:30</code> or <code>14:00</code>\n"
+        "• Relative time: <code>30m</code> or <code>45m</code> or <code>2h</code>\n"
+        "• Specific date: <code>2026-11-15 14:00</code>\n\n"
+        "<i>(Type /cancel to abort)</i>"
+    )
+
+    if callback.message:
+        await callback.message.edit_text(prompt, reply_markup=None, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(PlannerStates.waiting_for_task_alert_time, F.text)
+async def receive_task_alert_time(
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """Parse time and attach alert to the selected task."""
+    time_text = (message.text or "").strip()
+    if not time_text or time_text.startswith("/"):
+        return
+
+    data = await state.get_data()
+    task_id = data.get("alert_task_id")
+    task_text = data.get("alert_task_text", "Task")
+    user_id = message.from_user.id
+    now = get_now()
+
+    # Parse time (dummy task text appended to reuse parse_remind_command)
+    parsed = parse_remind_command(f"{time_text} {task_text}", now)
+    if not parsed:
+        await message.answer(
+            "⚠️ <b>Invalid time format.</b> Please try again:\n"
+            "• Examples: <code>18:30</code>, <code>45m</code>, <code>2h</code>, or <code>2026-11-15 14:00</code>\n"
+            "• Or /cancel to exit.",
+            parse_mode="HTML",
+        )
+        return
+
+    remind_dt, _ = parsed
+    remind_at_str = format_dt(remind_dt)
+
+    # 1. Update database
+    await db.reschedule_reminder(task_id, remind_at_str)
+
+    # 2. Schedule in APScheduler
+    schedule_task_reminder(
+        scheduler=scheduler,
+        bot=message.bot,
+        db=db,
+        task_id=task_id,
+        remind_dt=remind_dt,
+        admin_user_id=user_id,
+    )
+    await state.clear()
+
+    time_formatted = remind_dt.strftime("%Y-%m-%d %H:%M")
+    await message.answer(
+        f"✅ <b>Alert Set!</b>\n\n"
+        f"📌 Task: <b>{task_text}</b>\n"
+        f"🔔 Alert at: <b>{time_formatted}</b> (Asia/Tashkent)",
+        parse_mode="HTML",
+    )
+
+    # Show updated dashboard
+    text, keyboard = await build_planner_dashboard_message(user_id, db)
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
