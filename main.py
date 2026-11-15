@@ -1,6 +1,7 @@
 """
 Main entry point for the Personal Expense Tracker & Smart Daily Planner Telegram Bot.
-Initializes aiogram 3.x, SQLite (aiosqlite), APScheduler, and security middleware.
+Supports both Webhook mode (automatic for Render/cloud deployments via RENDER_EXTERNAL_URL)
+and Long-Polling mode (automatic for local development).
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # Compatibility for DefaultBotProperties across aiogram 3.x minor releases
 try:
@@ -30,7 +32,7 @@ from scheduler import (
     restore_persisted_reminders,
 )
 
-# Configure logging to both file and console (safely handles background pythonw)
+# Configure logging
 log_handlers: list[logging.Handler] = [
     logging.FileHandler("bot.log", encoding="utf-8"),
 ]
@@ -82,41 +84,8 @@ async def on_startup(bot: Bot, db: Database, scheduler) -> None:
         )
 
 
-async def start_health_server(port: int = 8080) -> web.AppRunner:
-    """
-    Starts a lightweight HTTP server for cloud platforms (Render, Koyeb, Railway).
-    Allows free cloud hosting with zero-downtime health checking.
-    """
-    app = web.Application()
-
-    async def health(request: web.Request) -> web.Response:
-        return web.Response(
-            text=(
-                "🤖 Telegram Expense Tracker & Smart Daily Planner Bot is LIVE!\n"
-                f"• Timezone: {settings.TIMEZONE_NAME}\n"
-                f"• Status: Healthy & Polling 24/7\n"
-            ),
-            content_type="text/plain",
-        )
-
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    app.router.add_get("/ping", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Cloud health-check HTTP server listening on 0.0.0.0:{port}")
-    return runner
-
-
-async def on_shutdown(bot: Bot, scheduler, web_runner: web.AppRunner | None = None) -> None:
+async def on_shutdown(bot: Bot, scheduler) -> None:
     """Graceful shutdown actions."""
-    if web_runner:
-        logger.info("Stopping HTTP health server...")
-        await web_runner.cleanup()
-
     logger.info("Shutting down APScheduler...")
     if scheduler.running:
         scheduler.shutdown(wait=False)
@@ -164,34 +133,85 @@ async def main() -> None:
     dp.callback_query.outer_middleware(admin_middleware)
 
     # 7. Register Routers in precedence order
-    # Common commands (/start, /help, /cancel)
     dp.include_router(common_router)
-    # Planner commands and FSM states (/plan, /todo, /remind, /in, night planning)
     dp.include_router(planner_router)
-    # Expense commands and natural text handler
     dp.include_router(expenses_router)
 
     # 8. Run startup lifecycle
     await on_startup(bot, db, scheduler)
 
-    # 9. Start cloud HTTP health server (enables Render Free Web Service & Koyeb 24/7)
-    web_runner: web.AppRunner | None = None
-    try:
-        http_port = int(os.getenv("PORT", "8080"))
-        web_runner = await start_health_server(http_port)
-    except Exception as e:
-        logger.warning(f"Could not bind HTTP health port: {e}. Polling will continue normally.")
+    # 9. Detect deployment mode: Cloud Webhook vs Local Polling
+    render_external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    webhook_url = os.getenv("WEBHOOK_URL", render_external_url).strip().rstrip("/")
 
-    # 10. Start polling
-    try:
-        # Delete webhook to prevent conflicts with long polling
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(
-            bot,
+    if webhook_url:
+        # =====================================================================
+        # CLOUD WEBHOOK MODE (Render / Production)
+        # In this mode, Telegram sends HTTP POST directly to Render,
+        # which automatically wakes Render up even from cold sleep!
+        # =====================================================================
+        webhook_path = "/webhook"
+        full_webhook_url = f"{webhook_url}{webhook_path}"
+        logger.info(f"Running in WEBHOOK mode. Setting webhook URL: {full_webhook_url}")
+
+        await bot.set_webhook(
+            url=full_webhook_url,
+            drop_pending_updates=False,
             allowed_updates=dp.resolve_used_update_types(),
         )
-    finally:
-        await on_shutdown(bot, scheduler, web_runner)
+
+        app = web.Application()
+
+        async def health(request: web.Request) -> web.Response:
+            return web.Response(
+                text=(
+                    "🤖 Telegram Expense Tracker & Smart Daily Planner Bot is LIVE!\n"
+                    f"• Mode: Webhook ({full_webhook_url})\n"
+                    f"• Timezone: {settings.TIMEZONE_NAME}\n"
+                    "• Status: Healthy & Active 24/7\n"
+                ),
+                content_type="text/plain",
+            )
+
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        app.router.add_get("/ping", health)
+
+        # Register aiogram webhook request handler
+        SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot,
+        ).register(app, path=webhook_path)
+        setup_application(app, dp, bot=bot)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        http_port = int(os.getenv("PORT", "8080"))
+        site = web.TCPSite(runner, "0.0.0.0", http_port)
+        await site.start()
+        logger.info(f"Webhook HTTP server successfully listening on 0.0.0.0:{http_port}")
+
+        # Keep server running until shutdown signal
+        stop_event = asyncio.Event()
+        try:
+            await stop_event.wait()
+        finally:
+            await runner.cleanup()
+            await on_shutdown(bot, scheduler)
+
+    else:
+        # =====================================================================
+        # LOCAL LONG-POLLING MODE (Development / Local PC)
+        # =====================================================================
+        logger.info("Running in LOCAL LONG-POLLING mode.")
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+            )
+        finally:
+            await on_shutdown(bot, scheduler)
 
 
 if __name__ == "__main__":
