@@ -132,7 +132,16 @@ async def handle_natural_expense_logging(message: Message, db: Database) -> None
     text = message.text or ""
     parsed = parse_expense_text(text)
     if not parsed:
-        # Not an expense message, let other handlers process or ignore
+        # Not an expense message and not a command: reply so the user always gets a response
+        await message.answer(
+            "👋 <b>I'm online and listening!</b>\n\n"
+            "• 💸 <b>To log an expense:</b> Start with a number (e.g. <code>45000 lunch</code> or <code>12k taxi</code>)\n"
+            "• ⏰ <b>To set an alert:</b> <code>/alert 15m Check oven</code> or <code>/alert 18:30 Call client</code>\n"
+            "• 📅 <b>To manage tasks:</b> Send /plan or tap <b>📅 My Planner</b>\n"
+            "• 📖 Send /help for the complete command list.",
+            reply_markup=get_main_reply_keyboard(),
+            parse_mode="HTML",
+        )
         return
 
     amount, category = parsed
