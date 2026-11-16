@@ -73,7 +73,7 @@ from config import (
     get_tomorrow_str,
     get_yesterday_str,
 )
-from handlers.expenses import parse_expense_text, format_report_message
+from handlers.expenses import parse_expense_text, format_report_message, is_expense_message
 from handlers.planner import parse_relative_time, parse_remind_command
 
 
@@ -106,6 +106,22 @@ class TestParsers(unittest.TestCase):
         self.assertIsNone(parse_expense_text("/remind 18:30"))
         self.assertIsNone(parse_expense_text("/spent 2026-11-14"))
         self.assertIsNone(parse_expense_text(""))
+
+    def test_is_expense_message(self):
+        # Valid expense messages
+        self.assertTrue(is_expense_message("45000 lunch"))
+        self.assertTrue(is_expense_message("12k taxi"))
+        self.assertTrue(is_expense_message("70k"))
+        self.assertTrue(is_expense_message("20000 coffee"))
+
+        # Must NOT match commands or buttons or period queries
+        self.assertFalse(is_expense_message("💸 Expenses"))
+        self.assertFalse(is_expense_message("this months"))
+        self.assertFalse(is_expense_message("this month"))
+        self.assertFalse(is_expense_message("today"))
+        self.assertFalse(is_expense_message("/expenses"))
+        self.assertFalse(is_expense_message("📅 My Planner"))
+        self.assertFalse(is_expense_message(None))
 
     def test_parse_relative_time(self):
         # Minutes

@@ -84,11 +84,14 @@ async def on_startup(bot: Bot, db: Database, scheduler) -> None:
         )
 
 
-async def on_shutdown(bot: Bot, scheduler) -> None:
+async def on_shutdown(bot: Bot, scheduler, db: Database) -> None:
     """Graceful shutdown actions."""
     logger.info("Shutting down APScheduler...")
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+    logger.info("Closing database connection...")
+    await db.close()
 
     logger.info("Closing bot session...")
     await bot.session.close()
@@ -197,7 +200,7 @@ async def main() -> None:
             await stop_event.wait()
         finally:
             await runner.cleanup()
-            await on_shutdown(bot, scheduler)
+            await on_shutdown(bot, scheduler, db)
 
     else:
         # =====================================================================
@@ -211,7 +214,7 @@ async def main() -> None:
                 allowed_updates=dp.resolve_used_update_types(),
             )
         finally:
-            await on_shutdown(bot, scheduler)
+            await on_shutdown(bot, scheduler, db)
 
 
 if __name__ == "__main__":

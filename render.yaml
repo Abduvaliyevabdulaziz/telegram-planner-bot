@@ -16,3 +16,5 @@ services:
         value: "70000"
       - key: TIMEZONE
         value: "Asia/Tashkent"
+      - key: DATABASE_URL
+        sync: false

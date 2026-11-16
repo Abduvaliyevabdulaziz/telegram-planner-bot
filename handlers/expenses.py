@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from typing import Any
 from aiogram import Router, F
 from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, BufferedInputFile
 
 from config import (
@@ -80,6 +79,13 @@ def parse_expense_text(text: str) -> tuple[int, str] | None:
         return None
 
 
+def is_expense_message(text: str | None) -> bool:
+    """Filter helper: returns True only if text starts with an expense amount."""
+    if not text:
+        return False
+    return parse_expense_text(text) is not None
+
+
 def format_report_message(
     title: str, stats: dict[str, Any], date_subtitle: str = ""
 ) -> str:
@@ -119,77 +125,46 @@ def format_report_message(
     return "\n".join(lines)
 
 
-# =============================================================================
-# Core Feature 1: Natural Text Logging & Budget Alert
-# =============================================================================
-
-@router.message(StateFilter(None), F.text)
-async def handle_natural_expense_logging(message: Message, db: Database) -> None:
-    """
-    Catches natural text messages starting with a number when not in an FSM state.
-    Logs expense, checks today's 70,000 UZS limit, and replies with confirmation + undo button.
-    """
-    text = message.text or ""
-    parsed = parse_expense_text(text)
-    if not parsed:
-        # Not an expense message and not a command: reply so the user always gets a response
-        await message.answer(
-            "👋 <b>I'm online and listening!</b>\n\n"
-            "• 💸 <b>To log an expense:</b> Start with a number (e.g. <code>45000 lunch</code> or <code>12k taxi</code>)\n"
-            "• ⏰ <b>To set an alert:</b> <code>/alert 15m Check oven</code> or <code>/alert 18:30 Call client</code>\n"
-            "• 📅 <b>To manage tasks:</b> Send /plan or tap <b>📅 My Planner</b>\n"
-            "• 📖 Send /help for the complete command list.",
-            reply_markup=get_main_reply_keyboard(),
-            parse_mode="HTML",
-        )
-        return
-
-    amount, category = parsed
-    user_id = message.from_user.id
+async def get_period_report_text(db: Database, user_id: int, period: str) -> str:
+    """Generates formatted report text for today, week, month, or 2months."""
     now = get_now()
-    created_at = format_dt(now)
-    today_str = get_today_str()
-
-    # 1. Save expense to database
-    expense_id = await db.add_expense(
-        user_id=user_id,
-        amount=amount,
-        category=category,
-        created_at=created_at,
-    )
-
-    # 2. Calculate today's total spending so far
-    today_total = await db.get_expenses_sum_for_date(user_id, today_str)
-    budget_limit = settings.DAILY_BUDGET_LIMIT
-
-    # 3. Format confirmation reply
-    lines = [
-        "✅ <b>Expense Logged!</b>",
-        f"💸 Amount: <b>{format_currency(amount)}</b>",
-        f"🏷️ Category: <b>{category}</b>",
-        f"📊 Today's Total: <b>{format_currency(today_total)}</b>",
-    ]
-
-    if today_total <= budget_limit:
-        remaining = budget_limit - today_total
-        lines.append(
-            f"🎯 Remaining Daily Budget: <b>{format_currency(remaining)}</b> (out of {format_currency(budget_limit)})"
-        )
+    if period in ("today", "day"):
+        today_str = get_today_str()
+        start_dt = f"{today_str} 00:00:00"
+        end_dt = f"{today_str} 23:59:59"
+        title = "Today's Expense Report"
+        subtitle = f"{today_str}"
+    elif period in ("week", "this week", "weekly"):
+        week_ago_str = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        today_str = get_today_str()
+        start_dt = f"{week_ago_str} 00:00:00"
+        end_dt = f"{today_str} 23:59:59"
+        title = "This Week's Expense Report (Last 7 Days)"
+        subtitle = f"{week_ago_str} to {today_str}"
+    elif period in ("month", "this month", "this months", "monthly"):
+        month_start_str = now.strftime("%Y-%m-01")
+        today_str = get_today_str()
+        start_dt = f"{month_start_str} 00:00:00"
+        end_dt = f"{today_str} 23:59:59"
+        title = f"This Month's Report ({now.strftime('%B %Y')})"
+        subtitle = f"{month_start_str} to {today_str}"
+    elif period in ("2months", "last 2 months"):
+        sixty_days_str = (now - timedelta(days=60)).strftime("%Y-%m-%d")
+        today_str = get_today_str()
+        start_dt = f"{sixty_days_str} 00:00:00"
+        end_dt = f"{today_str} 23:59:59"
+        title = "Last 2 Months Report (60 Days)"
+        subtitle = f"{sixty_days_str} to {today_str}"
     else:
-        # 70,000 UZS Daily Budget Cap Alert
-        over_amount = today_total - budget_limit
-        lines.append(
-            f"🎯 Remaining Daily Budget: <b>0 UZS</b> (out of {format_currency(budget_limit)})\n\n"
-            f"⚠️ <b>BUDGET ALERT: You have exceeded your {format_currency(budget_limit)} daily limit!</b>\n"
-            f"Today's total: <b>{format_currency(today_total)}</b> "
-            f"(+<b>{format_currency(over_amount)}</b> over limit)."
-        )
+        return "⚠️ Unknown period requested."
 
-    reply_text = "\n".join(lines)
-    keyboard = get_expense_undo_keyboard(expense_id)
+    stats = await db.get_expense_stats_by_period(user_id, start_dt, end_dt)
+    return format_report_message(title, stats, subtitle)
 
-    await message.answer(reply_text, reply_markup=keyboard, parse_mode="HTML")
 
+# =============================================================================
+# Undo Callback
+# =============================================================================
 
 @router.callback_query(F.data.startswith("del_exp:"))
 async def handle_undo_expense(callback: CallbackQuery, db: Database) -> None:
@@ -230,11 +205,11 @@ async def handle_undo_expense(callback: CallbackQuery, db: Database) -> None:
 
 
 # =============================================================================
-# Expense Reports & Filtering
+# Expense Reports Menu & Dashboard
 # =============================================================================
 
 @router.message(Command("expenses"))
-@router.message(F.text == "💸 Expenses")
+@router.message(F.text.func(lambda t: t and t.strip().lower() in ("💸 expenses", "expenses", "/expenses")))
 async def show_expenses_menu(message: Message) -> None:
     """Presents the expense reports menu with filter options."""
     text = (
@@ -254,41 +229,7 @@ async def handle_expense_filter_callback(callback: CallbackQuery, db: Database) 
     """Handles filter button clicks: today, week, month, 2months."""
     period = callback.data.split(":")[1]
     user_id = callback.from_user.id
-    now = get_now()
-
-    if period == "today":
-        today_str = get_today_str()
-        start_dt = f"{today_str} 00:00:00"
-        end_dt = f"{today_str} 23:59:59"
-        title = "Today's Expense Report"
-        subtitle = f"{today_str}"
-    elif period == "week":
-        week_ago_str = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        today_str = get_today_str()
-        start_dt = f"{week_ago_str} 00:00:00"
-        end_dt = f"{today_str} 23:59:59"
-        title = "This Week's Expense Report (Last 7 Days)"
-        subtitle = f"{week_ago_str} to {today_str}"
-    elif period == "month":
-        month_start_str = now.strftime("%Y-%m-01")
-        today_str = get_today_str()
-        start_dt = f"{month_start_str} 00:00:00"
-        end_dt = f"{today_str} 23:59:59"
-        title = f"This Month's Report ({now.strftime('%B %Y')})"
-        subtitle = f"{month_start_str} to {today_str}"
-    elif period == "2months":
-        sixty_days_str = (now - timedelta(days=60)).strftime("%Y-%m-%d")
-        today_str = get_today_str()
-        start_dt = f"{sixty_days_str} 00:00:00"
-        end_dt = f"{today_str} 23:59:59"
-        title = "Last 2 Months Report (60 Days)"
-        subtitle = f"{sixty_days_str} to {today_str}"
-    else:
-        await callback.answer("Unknown period.")
-        return
-
-    stats = await db.get_expense_stats_by_period(user_id, start_dt, end_dt)
-    report_text = format_report_message(title, stats, subtitle)
+    report_text = await get_period_report_text(db, user_id, period)
 
     # Edit message to show report and keep keyboard for further filtering
     if callback.message:
@@ -299,6 +240,40 @@ async def handle_expense_filter_callback(callback: CallbackQuery, db: Database) 
         )
     await callback.answer()
 
+
+# =============================================================================
+# Natural Text Period Queries (e.g. "this month", "this months", "today")
+# =============================================================================
+
+MONTH_QUERIES = {"this month", "this months", "month", "monthly", "current month"}
+WEEK_QUERIES = {"this week", "week", "weekly", "last 7 days"}
+TODAY_QUERIES = {"today", "todays", "today's expenses", "spent today"}
+
+@router.message(
+    StateFilter(None),
+    F.text.func(lambda t: t and t.strip().lower() in (MONTH_QUERIES | WEEK_QUERIES | TODAY_QUERIES))
+)
+async def handle_natural_period_query(message: Message, db: Database) -> None:
+    """Directly answers user queries like 'this months' or 'today' with the breakdown."""
+    text = (message.text or "").strip().lower()
+    if text in MONTH_QUERIES:
+        period = "month"
+    elif text in WEEK_QUERIES:
+        period = "week"
+    else:
+        period = "today"
+
+    report_text = await get_period_report_text(db, message.from_user.id, period)
+    await message.answer(
+        report_text,
+        reply_markup=get_expenses_menu_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# =============================================================================
+# Custom /spent Command
+# =============================================================================
 
 @router.message(Command("spent"))
 async def handle_spent_command(message: Message, db: Database) -> None:
@@ -431,3 +406,85 @@ async def handle_export_csv(event: Message | CallbackQuery, db: Database) -> Non
             caption=caption,
             parse_mode="HTML",
         )
+
+
+# =============================================================================
+# Core Feature 1: Natural Text Logging & Budget Alert
+# ONLY matches text that starts with a number/expense amount!
+# =============================================================================
+
+@router.message(StateFilter(None), F.text.func(is_expense_message))
+async def handle_natural_expense_logging(message: Message, db: Database) -> None:
+    """
+    Catches natural text messages starting with a number when not in an FSM state.
+    Logs expense, checks today's 70,000 UZS limit, and replies with confirmation + undo button.
+    """
+    text = message.text or ""
+    parsed = parse_expense_text(text)
+    if not parsed:
+        return
+
+    amount, category = parsed
+    user_id = message.from_user.id
+    now = get_now()
+    created_at = format_dt(now)
+    today_str = get_today_str()
+
+    # 1. Save expense to database
+    expense_id = await db.add_expense(
+        user_id=user_id,
+        amount=amount,
+        category=category,
+        created_at=created_at,
+    )
+
+    # 2. Calculate today's total spending so far
+    today_total = await db.get_expenses_sum_for_date(user_id, today_str)
+    budget_limit = settings.DAILY_BUDGET_LIMIT
+
+    # 3. Format confirmation reply
+    lines = [
+        "✅ <b>Expense Logged!</b>",
+        f"💸 Amount: <b>{format_currency(amount)}</b>",
+        f"🏷️ Category: <b>{category}</b>",
+        f"📊 Today's Total: <b>{format_currency(today_total)}</b>",
+    ]
+
+    if today_total <= budget_limit:
+        remaining = budget_limit - today_total
+        lines.append(
+            f"🎯 Remaining Daily Budget: <b>{format_currency(remaining)}</b> (out of {format_currency(budget_limit)})"
+        )
+    else:
+        # 70,000 UZS Daily Budget Cap Alert
+        over_amount = today_total - budget_limit
+        lines.append(
+            f"🎯 Remaining Daily Budget: <b>0 UZS</b> (out of {format_currency(budget_limit)})\n\n"
+            f"⚠️ <b>BUDGET ALERT: You have exceeded your {format_currency(budget_limit)} daily limit!</b>\n"
+            f"Today's total: <b>{format_currency(today_total)}</b> "
+            f"(+<b>{format_currency(over_amount)}</b> over limit)."
+        )
+
+    reply_text = "\n".join(lines)
+    keyboard = get_expense_undo_keyboard(expense_id)
+
+    await message.answer(reply_text, reply_markup=keyboard, parse_mode="HTML")
+
+
+# =============================================================================
+# Fallback Handler: Only triggers if NO other command, button, or query matched!
+# =============================================================================
+
+@router.message(StateFilter(None), F.text)
+async def handle_unrecognized_text(message: Message) -> None:
+    """Fallback guidance when a sent message is not recognized."""
+    await message.answer(
+        "👋 <b>I'm online and listening!</b>\n\n"
+        "• 💸 <b>To log an expense:</b> Start with a number (e.g. <code>45000 lunch</code> or <code>12k taxi</code>)\n"
+        "• 📊 <b>To view spending:</b> Tap <b>💸 Expenses</b> or send <code>this month</code> / <code>/expenses</code>\n"
+        "• ⏰ <b>To set an alert:</b> <code>/alert 15m Check oven</code> or <code>/alert 18:30 Call client</code>\n"
+        "• 📅 <b>To manage tasks:</b> Send /plan or tap <b>📅 My Planner</b>\n"
+        "• 📖 Send /help for the complete command list.",
+        reply_markup=get_main_reply_keyboard(),
+        parse_mode="HTML",
+    )

@@ -36,6 +36,7 @@ class Settings:
 
     # Database
     DB_PATH: Path = BASE_DIR / os.getenv("DB_FILE_NAME", "planner_bot.db").strip()
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "").strip()
 
     # Scheduler fixed hours (Tashkent local time)
     EVENING_PLAN_HOUR: int = int(os.getenv("EVENING_PLAN_HOUR", "21").strip() or "21")
