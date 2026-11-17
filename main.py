@@ -24,6 +24,7 @@ except ImportError:
 
 from config import settings, TIMEZONE, format_currency
 from database import Database
+from cloud_sync import CloudSyncManager
 from handlers import common_router, expenses_router, planner_router
 from middlewares import AdminMiddleware
 from scheduler import (
@@ -47,10 +48,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def on_startup(bot: Bot, db: Database, scheduler) -> None:
+async def on_startup(bot: Bot, db: Database, scheduler, cloud_sync: CloudSyncManager | None = None) -> None:
     """Startup initialization tasks."""
+    if cloud_sync and not db.is_postgres:
+        logger.info("Checking Telegram cloud backup before initializing database...")
+        restored = await cloud_sync.restore_if_needed()
+        if restored:
+            logger.info("Restored database from Telegram cloud storage successfully!")
+
     logger.info("Initializing database...")
     await db.init_db()
+
+    # Schedule initial backup if database has tables
+    if cloud_sync and not db.is_postgres:
+        cloud_sync.schedule_sync(delay=2.0)
 
     logger.info("Registering APScheduler fixed cron jobs (21:00 & 09:00)...")
     register_fixed_cron_jobs(scheduler, bot, db, settings.ADMIN_USER_ID)
@@ -72,7 +83,8 @@ async def on_startup(bot: Bot, db: Database, scheduler) -> None:
                 "🤖 <b>Bot started and active!</b>\n"
                 f"• Timezone: <b>{settings.TIMEZONE_NAME} (UTC+5)</b>\n"
                 f"• Daily Budget Limit: <b>{limit_fmt}</b>\n"
-                f"• Restored Active Reminders: <b>{restored_count}</b>\n\n"
+                f"• Restored Active Reminders: <b>{restored_count}</b>\n"
+                "• Storage: <b>Cloud Auto-Sync Active ✅</b>\n\n"
                 "Ready to track expenses and plan your day. Send /help for command list."
             ),
             parse_mode="HTML",
@@ -84,11 +96,18 @@ async def on_startup(bot: Bot, db: Database, scheduler) -> None:
         )
 
 
-async def on_shutdown(bot: Bot, scheduler, db: Database) -> None:
+async def on_shutdown(bot: Bot, scheduler, db: Database, cloud_sync: CloudSyncManager | None = None) -> None:
     """Graceful shutdown actions."""
     logger.info("Shutting down APScheduler...")
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+    if cloud_sync and not db.is_postgres:
+        logger.info("Syncing latest database to Telegram before shutdown...")
+        try:
+            await cloud_sync.sync_now()
+        except Exception as e:
+            logger.error(f"Error syncing on shutdown: {e}")
 
     logger.info("Closing database connection...")
     await db.close()
@@ -122,13 +141,16 @@ async def main() -> None:
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
-    # 4. Initialize Database and Scheduler
+    # 4. Initialize Database, Cloud Sync, and Scheduler
     db = Database(settings.DB_PATH)
+    cloud_sync = CloudSyncManager(bot, settings.DB_PATH, settings.ADMIN_USER_ID)
+    db.set_cloud_sync(cloud_sync)
     scheduler = create_scheduler()
 
     # 5. Dependency Injection for Handlers (Workflow Data)
     dp["db"] = db
     dp["scheduler"] = scheduler
+    dp["cloud_sync"] = cloud_sync
 
     # 6. Register Security Middleware (Blocks all unauthorized users)
     admin_middleware = AdminMiddleware(settings.ADMIN_USER_ID)
@@ -141,7 +163,7 @@ async def main() -> None:
     dp.include_router(expenses_router)
 
     # 8. Run startup lifecycle
-    await on_startup(bot, db, scheduler)
+    await on_startup(bot, db, scheduler, cloud_sync)
 
     # 9. Detect deployment mode: Cloud Webhook vs Local Polling
     render_external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
@@ -200,7 +222,7 @@ async def main() -> None:
             await stop_event.wait()
         finally:
             await runner.cleanup()
-            await on_shutdown(bot, scheduler, db)
+            await on_shutdown(bot, scheduler, db, cloud_sync)
 
     else:
         # =====================================================================
@@ -214,7 +236,7 @@ async def main() -> None:
                 allowed_updates=dp.resolve_used_update_types(),
             )
         finally:
-            await on_shutdown(bot, scheduler, db)
+            await on_shutdown(bot, scheduler, db, cloud_sync)
 
 
 if __name__ == "__main__":

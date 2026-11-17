@@ -34,6 +34,16 @@ class Database:
         )
         self.db_path = str(db_path or settings.DB_PATH)
         self.pool: Any = None
+        self.cloud_sync: Any = None
+
+    def set_cloud_sync(self, cloud_sync: Any) -> None:
+        """Attach CloudSyncManager to automatically backup SQLite changes."""
+        self.cloud_sync = cloud_sync
+
+    def _trigger_sync(self) -> None:
+        """Schedule a background sync to Telegram cloud storage if using SQLite."""
+        if not self.is_postgres and self.cloud_sync is not None:
+            self.cloud_sync.schedule_sync()
 
     async def init_db(self) -> None:
         """Create tables and indexes if they do not exist."""
@@ -164,7 +174,9 @@ class Database:
                     (user_id, int(amount), category.strip(), ts),
                 )
                 await db.commit()
-                return cursor.lastrowid
+                row_id = cursor.lastrowid
+            self._trigger_sync()
+            return row_id
 
     async def delete_expense(self, expense_id: int, user_id: int) -> bool:
         """Delete an expense by ID if it belongs to the user."""
@@ -182,7 +194,10 @@ class Database:
                     (expense_id, user_id),
                 )
                 await db.commit()
-                return cursor.rowcount > 0
+                deleted = cursor.rowcount > 0
+            if deleted:
+                self._trigger_sync()
+            return deleted
 
     async def get_expense_by_id(self, expense_id: int) -> dict[str, Any] | None:
         """Fetch a single expense by its ID."""
@@ -420,7 +435,9 @@ class Database:
                     (user_id, task_text.strip(), target_date, remind_at, ts),
                 )
                 await db.commit()
-                return cursor.lastrowid
+                task_id = cursor.lastrowid
+            self._trigger_sync()
+            return task_id
 
     async def add_multiple_tasks(
         self, user_id: int, task_texts: list[str], target_date: str
@@ -459,6 +476,7 @@ class Database:
                     )
                     task_ids.append(cursor.lastrowid)
                 await db.commit()
+            self._trigger_sync()
             return task_ids
 
     async def get_task_by_id(self, task_id: int) -> dict[str, Any] | None:
@@ -504,7 +522,10 @@ class Database:
                     (task_id, user_id),
                 )
                 await db.commit()
-                return cursor.rowcount > 0
+                ok = cursor.rowcount > 0
+            if ok:
+                self._trigger_sync()
+            return ok
 
     async def toggle_task_status(self, task_id: int, user_id: int) -> dict[str, Any] | None:
         """Toggle task completion between 0 and 1."""
@@ -550,7 +571,9 @@ class Database:
                     (task_id,),
                 ) as cursor:
                     updated_row = await cursor.fetchone()
-                    return dict(updated_row) if updated_row else None
+            if updated_row:
+                self._trigger_sync()
+            return dict(updated_row) if updated_row else None
 
     async def delete_task(self, task_id: int, user_id: int) -> bool:
         """Delete a task by ID."""
@@ -568,7 +591,10 @@ class Database:
                     (task_id, user_id),
                 )
                 await db.commit()
-                return cursor.rowcount > 0
+                deleted = cursor.rowcount > 0
+            if deleted:
+                self._trigger_sync()
+            return deleted
 
     async def reschedule_reminder(self, task_id: int, new_remind_at: str) -> bool:
         """Reschedule a task's reminder timestamp and reset completion status."""
@@ -590,7 +616,10 @@ class Database:
                     (new_remind_at, task_id),
                 )
                 await db.commit()
-                return cursor.rowcount > 0
+                ok = cursor.rowcount > 0
+            if ok:
+                self._trigger_sync()
+            return ok
 
     async def get_tasks_for_date(self, user_id: int, target_date: str) -> list[dict[str, Any]]:
         """Fetch all tasks planned for a specific date (YYYY-MM-DD)."""
