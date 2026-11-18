@@ -15,7 +15,7 @@ try:
 except ImportError:
     asyncpg = None
 
-from config import settings, format_dt, get_now
+from config import settings, format_dt, get_now, get_today_str
 
 logger = logging.getLogger(__name__)
 
@@ -621,8 +621,58 @@ class Database:
                 self._trigger_sync()
             return ok
 
+    async def rollover_uncompleted_tasks(self, user_id: int, today_str: str) -> int:
+        """
+        Roll over uncompleted tasks from past dates into today.
+        Guarantees that pending to-dos are never lost when dates change.
+        Also cleans up any accidental tasks created from reply menu button taps.
+        """
+        cleanup_query_pg = """
+            DELETE FROM tasks
+            WHERE user_id = $1 AND task_text IN ('📅 My Planner', '💸 Expenses', '➕ Quick Todo', '📊 Today''s Summary')
+        """
+        cleanup_query_sqlite = """
+            DELETE FROM tasks
+            WHERE user_id = ? AND task_text IN ('📅 My Planner', '💸 Expenses', '➕ Quick Todo', '📊 Today''s Summary')
+        """
+        if self.is_postgres:
+            async with self.pool.acquire() as conn:
+                await conn.execute(cleanup_query_pg, user_id)
+                res = await conn.execute(
+                    """
+                    UPDATE tasks
+                    SET target_date = $1
+                    WHERE user_id = $2 AND target_date < $1 AND is_completed = 0
+                    """,
+                    today_str, user_id,
+                )
+                count = int(res.split()[1]) if " " in res else 0
+                if count > 0:
+                    self._trigger_sync()
+                return count
+        else:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(cleanup_query_sqlite, (user_id,))
+                cursor = await db.execute(
+                    """
+                    UPDATE tasks
+                    SET target_date = ?
+                    WHERE user_id = ? AND target_date < ? AND is_completed = 0
+                    """,
+                    (today_str, user_id, today_str),
+                )
+                await db.commit()
+                count = cursor.rowcount
+            if count > 0:
+                self._trigger_sync()
+            return count
+
     async def get_tasks_for_date(self, user_id: int, target_date: str) -> list[dict[str, Any]]:
         """Fetch all tasks planned for a specific date (YYYY-MM-DD)."""
+        today_str = get_today_str()
+        if target_date == today_str:
+            await self.rollover_uncompleted_tasks(user_id, today_str)
+
         if self.is_postgres:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(

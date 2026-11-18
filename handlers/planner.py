@@ -52,6 +52,61 @@ class PlannerStates(StatesGroup):
     waiting_for_task_alert_time = State()
 
 
+MAIN_MENU_BUTTONS = {"💸 Expenses", "📅 My Planner", "➕ Quick Todo", "📊 Today's Summary"}
+
+PLANNER_QUERIES = {
+    "plan", "my plan", "planner", "my planner",
+    "todo", "to do", "to-do", "todos", "to dos",
+    "todo list", "to do list", "to-do list", "todos list",
+    "tasks", "my tasks", "task list", "my task list",
+    "today tasks", "today's tasks", "todays tasks",
+    "what to do", "list", "my list"
+}
+
+
+def is_natural_todo_add(text: str | None) -> bool:
+    """Matches natural todo creation like 'todo Buy milk', 'to-do: Call client'."""
+    if not text:
+        return False
+    t = text.strip()
+    low = t.lower()
+    for prefix in ("todo: ", "todo ", "to-do: ", "to-do ", "to do: "):
+        if low.startswith(prefix) and len(t) > len(prefix):
+            return True
+    return False
+
+
+async def handle_button_breakout(message: Message, state: FSMContext, db: Database) -> bool:
+    """If user taps a main menu button or command while in an FSM state, clear state and handle immediately."""
+    text = (message.text or "").strip()
+    if text in MAIN_MENU_BUTTONS or text.startswith("/"):
+        await state.clear()
+        if text == "📅 My Planner" or text == "/plan":
+            text_resp, keyboard = await build_planner_dashboard_message(message.from_user.id, db)
+            await message.answer(text_resp, reply_markup=keyboard, parse_mode="HTML")
+            return True
+        elif text == "➕ Quick Todo":
+            await state.set_state(PlannerStates.waiting_for_quick_todo)
+            await message.answer(
+                "✍️ <b>Enter task text for today:</b>\n<i>(Send your task description, or /cancel to abort)</i>",
+                parse_mode="HTML",
+            )
+            return True
+        elif text == "📊 Today's Summary":
+            from handlers.common import handle_todays_summary
+            await handle_todays_summary(message, db)
+            return True
+        elif text == "💸 Expenses":
+            from handlers.expenses import show_expenses_menu
+            await show_expenses_menu(message)
+            return True
+        elif text == "/cancel":
+            await message.answer("❌ Action cancelled.", reply_markup=get_main_reply_keyboard())
+            return True
+        return False
+    return False
+
+
 # =============================================================================
 # Parsers for Reminders
 # =============================================================================
@@ -221,11 +276,17 @@ async def start_tomorrow_planning(
 
 @router.message(PlannerStates.waiting_for_tomorrow_plan, F.text)
 async def handle_incoming_night_plan_text(
-    message: Message, state: FSMContext
+    message: Message, state: FSMContext, db: Database
 ) -> None:
     """Capture multi-line or individual task text for tomorrow."""
+    if await handle_button_breakout(message, state, db):
+        return
+
     text = message.text or ""
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    lines = [
+        line.strip() for line in text.split("\n")
+        if line.strip() and line.strip() not in MAIN_MENU_BUTTONS and not line.strip().startswith("/")
+    ]
 
     if not lines:
         return
@@ -312,7 +373,7 @@ async def cancel_tomorrow_planning(callback: CallbackQuery, state: FSMContext) -
 @router.message(Command("todo"))
 async def handle_todo_command(message: Message, db: Database) -> None:
     """
-    Add a general To-Do item for today:
+    Add a general To-Do item for today or view current to-do list:
       /todo [task text]
     """
     user_id = message.from_user.id
@@ -320,13 +381,58 @@ async def handle_todo_command(message: Message, db: Database) -> None:
     parts = text.split(maxsplit=1)
 
     if len(parts) < 2 or not parts[1].strip():
+        text_resp, keyboard = await build_planner_dashboard_message(user_id, db)
         await message.answer(
-            "ℹ️ <b>Usage:</b> <code>/todo Buy milk and bread</code>",
+            f"{text_resp}\n\n💡 <i>To add a new task, send:</i> <code>/todo Buy milk</code> <i>or tap ➕ Quick Todo below.</i>",
+            reply_markup=keyboard,
             parse_mode="HTML",
         )
         return
 
     task_text = parts[1].strip()
+    if task_text in MAIN_MENU_BUTTONS:
+        return
+
+    today_str = get_today_str()
+
+    task_id = await db.add_task(
+        user_id=user_id,
+        task_text=task_text,
+        target_date=today_str,
+        remind_at=None,
+    )
+
+    builder = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Mark Done", callback_data=f"done_task:{task_id}"),
+                InlineKeyboardButton(text="🗑️ Delete", callback_data=f"del_task:{task_id}"),
+            ]
+        ]
+    )
+
+    await message.answer(
+        f"✅ <b>Task Added for Today ({today_str}):</b>\n\n📌 {task_text}",
+        reply_markup=builder,
+        parse_mode="HTML",
+    )
+
+
+@router.message(StateFilter(None), F.text.func(is_natural_todo_add))
+async def handle_natural_todo_add(message: Message, db: Database) -> None:
+    """Adds a task when user types 'todo Buy groceries' or 'todo: Call client'."""
+    text = (message.text or "").strip()
+    low = text.lower()
+    task_text = ""
+    for prefix in ("todo: ", "todo ", "to-do: ", "to-do ", "to do: "):
+        if low.startswith(prefix):
+            task_text = text[len(prefix):].strip()
+            break
+
+    if not task_text or task_text in MAIN_MENU_BUTTONS:
+        return
+
+    user_id = message.from_user.id
     today_str = get_today_str()
 
     task_id = await db.add_task(
@@ -368,8 +474,11 @@ async def receive_quick_todo_text(
     message: Message, state: FSMContext, db: Database
 ) -> None:
     """Save quick todo entered via prompt."""
+    if await handle_button_breakout(message, state, db):
+        return
+
     task_text = (message.text or "").strip()
-    if not task_text or task_text.startswith("/"):
+    if not task_text or task_text.startswith("/") or task_text in MAIN_MENU_BUTTONS:
         return
 
     user_id = message.from_user.id
@@ -631,8 +740,12 @@ async def handle_snooze_task(
 # Interactive Planner Menu (/plan and 📅 My Planner)
 # =============================================================================
 
-@router.message(Command("plan"))
+@router.message(Command("plan", "tasks", "todos", "todo_list"))
 @router.message(F.text == "📅 My Planner")
+@router.message(
+    StateFilter(None),
+    F.text.func(lambda t: t and t.strip().lower() in PLANNER_QUERIES)
+)
 async def show_planner_dashboard(message: Message, db: Database) -> None:
     """Render the interactive daily planner dashboard."""
     user_id = message.from_user.id
@@ -670,8 +783,11 @@ async def receive_single_today_task(
     message: Message, state: FSMContext, db: Database
 ) -> None:
     """Receive task for today."""
+    if await handle_button_breakout(message, state, db):
+        return
+
     task_text = (message.text or "").strip()
-    if not task_text or task_text.startswith("/"):
+    if not task_text or task_text.startswith("/") or task_text in MAIN_MENU_BUTTONS:
         return
 
     user_id = message.from_user.id
@@ -705,8 +821,11 @@ async def receive_single_tomorrow_task(
     message: Message, state: FSMContext, db: Database
 ) -> None:
     """Receive task for tomorrow."""
+    if await handle_button_breakout(message, state, db):
+        return
+
     task_text = (message.text or "").strip()
-    if not task_text or task_text.startswith("/"):
+    if not task_text or task_text.startswith("/") or task_text in MAIN_MENU_BUTTONS:
         return
 
     user_id = message.from_user.id
@@ -844,8 +963,11 @@ async def receive_task_alert_time(
     scheduler: AsyncIOScheduler,
 ) -> None:
     """Parse time and attach alert to the selected task."""
+    if await handle_button_breakout(message, state, db):
+        return
+
     time_text = (message.text or "").strip()
-    if not time_text or time_text.startswith("/"):
+    if not time_text or time_text.startswith("/") or time_text in MAIN_MENU_BUTTONS:
         return
 
     data = await state.get_data()

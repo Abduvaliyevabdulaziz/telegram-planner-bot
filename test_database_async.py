@@ -92,6 +92,31 @@ class TestAsyncDatabase(unittest.IsolatedAsyncioTestCase):
         task_after_snooze = await self.db.get_task_by_id(remind_id)
         self.assertEqual(task_after_snooze["remind_at"], snoozed_time)
 
+    async def test_rollover_uncompleted_tasks(self):
+        user_id = 999
+        yesterday = "2026-11-13"
+        today = "2026-11-14"
+
+        # Add uncompleted task for yesterday
+        task_id = await self.db.add_task(user_id, "Old uncompleted task", yesterday)
+        # Add completed task for yesterday
+        completed_id = await self.db.add_task(user_id, "Old completed task", yesterday)
+        await self.db.mark_task_completed(completed_id, user_id)
+
+        # Roll over
+        count = await self.db.rollover_uncompleted_tasks(user_id, today)
+        self.assertEqual(count, 1)
+
+        # Verify task is now on today's list
+        today_tasks = await self.db.get_tasks_for_date(user_id, today)
+        self.assertEqual(len(today_tasks), 1)
+        self.assertEqual(today_tasks[0]["task_text"], "Old uncompleted task")
+
+        # Verify completed task remained on yesterday
+        yesterday_tasks = await self.db.get_tasks_for_date(user_id, yesterday)
+        self.assertEqual(len(yesterday_tasks), 1)
+        self.assertEqual(yesterday_tasks[0]["task_text"], "Old completed task")
+
 
 if __name__ == "__main__":
     unittest.main()

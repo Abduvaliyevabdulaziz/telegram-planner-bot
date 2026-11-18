@@ -74,7 +74,7 @@ from config import (
     get_yesterday_str,
 )
 from handlers.expenses import parse_expense_text, format_report_message, is_expense_message
-from handlers.planner import parse_relative_time, parse_remind_command
+from handlers.planner import parse_relative_time, parse_remind_command, is_natural_todo_add
 
 
 class TestParsers(unittest.TestCase):
@@ -122,6 +122,16 @@ class TestParsers(unittest.TestCase):
         self.assertFalse(is_expense_message("/expenses"))
         self.assertFalse(is_expense_message("📅 My Planner"))
         self.assertFalse(is_expense_message(None))
+
+    def test_is_natural_todo_add(self):
+        self.assertTrue(is_natural_todo_add("todo Buy groceries"))
+        self.assertTrue(is_natural_todo_add("todo: Call client"))
+        self.assertTrue(is_natural_todo_add("to-do Finish project"))
+        self.assertTrue(is_natural_todo_add("to do: Prepare slides"))
+        self.assertFalse(is_natural_todo_add("todo"))
+        self.assertFalse(is_natural_todo_add("to do"))
+        self.assertFalse(is_natural_todo_add("45000 lunch"))
+        self.assertFalse(is_natural_todo_add(None))
 
     def test_parse_relative_time(self):
         # Minutes
