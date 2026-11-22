@@ -14,8 +14,8 @@ jobs:
         run: |
           URL="${{ secrets.RENDER_URL }}"
           if [ -z "$URL" ]; then
-            URL="https://telegram-planner-bot.onrender.com"
+            URL="https://telegram-planner-bot-1rub.onrender.com"
           fi
           echo "Sending keep-alive ping to $URL..."
-          curl -s -f -m 60 "$URL/health" || curl -s -m 60 "$URL" || true
+          curl -s -f -m 60 "$URL/ping" || curl -s -f -m 60 "$URL/health" || curl -s -m 60 "$URL" || true
           echo "Keep-alive ping sent successfully."
