@@ -209,7 +209,7 @@ async def handle_undo_expense(callback: CallbackQuery, db: Database) -> None:
 # =============================================================================
 
 @router.message(Command("expenses"))
-@router.message(F.text.func(lambda t: t and t.strip().lower() in ("💸 expenses", "expenses", "/expenses")))
+@router.message(F.text.func(lambda t: t and t.strip().lower() in ("💸 expenses", "expenses", "/expenses", "all expenses", "show expenses", "view expenses")))
 async def show_expenses_menu(message: Message) -> None:
     """Presents the expense reports menu with filter options."""
     text = (
@@ -245,9 +245,20 @@ async def handle_expense_filter_callback(callback: CallbackQuery, db: Database) 
 # Natural Text Period Queries (e.g. "this month", "this months", "today")
 # =============================================================================
 
-MONTH_QUERIES = {"this month", "this months", "month", "monthly", "current month"}
-WEEK_QUERIES = {"this week", "week", "weekly", "last 7 days"}
-TODAY_QUERIES = {"today", "todays", "today's expenses", "spent today"}
+MONTH_QUERIES = {
+    "this month", "this months", "month", "monthly", "current month",
+    "spent this month", "this month spent", "expenses this month",
+    "this month expenses", "overall spent", "all spent", "total spent",
+    "how much spent this month", "how much i spent this month",
+}
+WEEK_QUERIES = {
+    "this week", "week", "weekly", "last 7 days", "spent this week",
+    "this week spent", "week expenses", "this week expenses",
+}
+TODAY_QUERIES = {
+    "today", "todays", "today's expenses", "spent today", "today spent",
+    "today expense", "today expenses",
+}
 
 @router.message(
     StateFilter(None),

@@ -621,6 +621,59 @@ class Database:
                 self._trigger_sync()
             return ok
 
+    async def clear_task_remind_at(self, task_id: int) -> bool:
+        """Clear a task's remind_at timestamp once the alert has been delivered."""
+        if self.is_postgres:
+            async with self.pool.acquire() as conn:
+                res = await conn.execute(
+                    "UPDATE tasks SET remind_at = NULL WHERE id = $1",
+                    task_id,
+                )
+                return res != "UPDATE 0"
+        else:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    "UPDATE tasks SET remind_at = NULL WHERE id = ?",
+                    (task_id,),
+                )
+                await db.commit()
+                ok = cursor.rowcount > 0
+            if ok:
+                self._trigger_sync()
+            return ok
+
+    async def get_overdue_uncompleted_reminders(self, now_str: str) -> list[dict[str, Any]]:
+        """
+        Fetch all uncompleted tasks whose remind_at timestamp is <= now_str.
+        Used to immediately flush reminders that passed while the server was asleep.
+        """
+        if self.is_postgres:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, user_id, task_text, target_date, remind_at, is_completed
+                    FROM tasks
+                    WHERE is_completed = 0 AND remind_at IS NOT NULL AND remind_at <= $1
+                    ORDER BY remind_at ASC
+                    """,
+                    now_str,
+                )
+                return [dict(r) for r in rows]
+        else:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    """
+                    SELECT id, user_id, task_text, target_date, remind_at, is_completed
+                    FROM tasks
+                    WHERE is_completed = 0 AND remind_at IS NOT NULL AND remind_at <= ?
+                    ORDER BY remind_at ASC
+                    """,
+                    (now_str,),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    return [dict(r) for r in rows]
+
     async def rollover_uncompleted_tasks(self, user_id: int, today_str: str) -> int:
         """
         Roll over uncompleted tasks from past dates into today.

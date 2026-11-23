@@ -31,6 +31,7 @@ from scheduler import (
     create_scheduler,
     register_fixed_cron_jobs,
     restore_persisted_reminders,
+    flush_overdue_reminders,
 )
 
 # Configure logging
@@ -70,6 +71,9 @@ async def on_startup(bot: Bot, db: Database, scheduler, cloud_sync: CloudSyncMan
     restored_count = await restore_persisted_reminders(
         scheduler, bot, db, settings.ADMIN_USER_ID
     )
+    overdue_count = await flush_overdue_reminders(bot, db, settings.ADMIN_USER_ID)
+    if overdue_count > 0:
+        logger.info(f"Delivered {overdue_count} overdue reminders on startup.")
 
     logger.info("Starting APScheduler...")
     scheduler.start()
@@ -188,6 +192,10 @@ async def main() -> None:
         app = web.Application()
 
         async def health(request: web.Request) -> web.Response:
+            try:
+                asyncio.create_task(flush_overdue_reminders(bot, db, settings.ADMIN_USER_ID))
+            except Exception:
+                pass
             return web.Response(
                 text=(
                     "🤖 Telegram Expense Tracker & Smart Daily Planner Bot is LIVE!\n"

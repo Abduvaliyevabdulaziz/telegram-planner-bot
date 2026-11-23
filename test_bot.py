@@ -41,6 +41,11 @@ aiogram_types_mock.Message = MockMessage
 aiogram_types_mock.CallbackQuery = MockCallbackQuery
 sys.modules["aiogram.types"] = aiogram_types_mock
 
+try:
+    import aiosqlite
+except ImportError:
+    sys.modules["aiosqlite"] = MagicMock()
+
 for mod in [
     "aiogram.enums",
     "aiogram.filters",
@@ -50,7 +55,6 @@ for mod in [
     "aiogram.fsm.storage.memory",
     "aiogram.utils",
     "aiogram.utils.keyboard",
-    "aiosqlite",
     "apscheduler",
     "apscheduler.schedulers",
     "apscheduler.schedulers.asyncio",

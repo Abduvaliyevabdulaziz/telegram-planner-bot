@@ -159,8 +159,41 @@ async def send_reminder_alert(
             parse_mode="HTML",
         )
         logger.info(f"Reminder alert successfully sent for task_id={task_id}")
+        await db.clear_task_remind_at(task_id)
     except Exception as e:
         logger.error(f"Failed to deliver reminder for task_id={task_id}: {e}", exc_info=True)
+
+
+async def flush_overdue_reminders(bot: Bot, db: Database, admin_user_id: int) -> int:
+    """
+    Checks for any uncompleted tasks whose reminder time has passed
+    (e.g. while Render was sleeping or restarting) and delivers them immediately.
+    """
+    now = get_now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    overdue = await db.get_overdue_uncompleted_reminders(now_str)
+    sent_count = 0
+    for task in overdue:
+        task_id = task["id"]
+        try:
+            remind_time = task.get("remind_at", "earlier")
+            time_part = remind_time[11:16] if len(remind_time) >= 16 else remind_time
+            text = (
+                f"🔔 <b>REMINDER</b> <i>(Scheduled for {time_part})</i>:\n\n"
+                f"📌 <b>{task['task_text']}</b>"
+            )
+            await bot.send_message(
+                chat_id=admin_user_id,
+                text=text,
+                reply_markup=get_reminder_alert_keyboard(task_id),
+                parse_mode="HTML",
+            )
+            await db.clear_task_remind_at(task_id)
+            sent_count += 1
+            logger.info(f"Overdue reminder delivered for task_id={task_id}")
+        except Exception as e:
+            logger.error(f"Failed delivering overdue reminder {task_id}: {e}")
+    return sent_count
 
 
 # =============================================================================
@@ -187,6 +220,7 @@ def register_fixed_cron_jobs(
         id="cron_nightly_plan_prompt",
         name="21:00 Evening Planning Prompt",
         replace_existing=True,
+        misfire_grace_time=3600,
         args=[bot, admin_user_id],
     )
 
@@ -201,6 +235,7 @@ def register_fixed_cron_jobs(
         id="cron_morning_briefing",
         name="09:00 Morning Briefing",
         replace_existing=True,
+        misfire_grace_time=3600,
         args=[bot, db, admin_user_id],
     )
     logger.info("Fixed cron jobs (21:00 Nightly and 09:00 Morning) registered.")
@@ -227,6 +262,7 @@ def schedule_task_reminder(
         id=job_id,
         name=f"Task Reminder {task_id}",
         replace_existing=True,
+        misfire_grace_time=None,  # Never skip overdue reminders due to container suspension
         args=[bot, db, task_id, admin_user_id],
     )
     logger.info(f"Scheduled reminder job_id={job_id} at {remind_dt.isoformat()}")
